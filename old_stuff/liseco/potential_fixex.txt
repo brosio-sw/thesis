@@ -1,0 +1,2 @@
+-maybe does t work well because of the fact we use mean to train the proves but act individually
+-only correct if 𝑧>𝑧max ie no interval

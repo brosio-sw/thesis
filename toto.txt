@@ -1,0 +1,5 @@
+-use coherence to evaluate  (see https://arxiv.org/pdf/2509.21528)
+-my perplexity measure might favor conf llada
+- https://arxiv.org/pdf/2510.08632  : nice for carmen idea of between denoise steer but code not public
+
+-gaussian et pca
