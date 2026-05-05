@@ -3,6 +3,7 @@ Fluency & quality metrics for generated text.
 
 Metrics computed:
   * **Perplexity** under Qwen2.5-3B — standard proxy for fluency / coherence.
+    * **Prompt-response coherence** via SimCSE cosine similarity.
   * **Repetition rate** — fraction of unique n-grams (lower = more repetition).
   * **Mean generation length** (in tokens / characters).
 
@@ -19,12 +20,15 @@ from typing import List
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 
 QWEN_MODEL_NAME = "Qwen/Qwen2.5-3B"
+SIMCSE_MODEL_NAME = "princeton-nlp/sup-simcse-bert-base-uncased"
 _qwen_model = None
 _qwen_tokenizer = None
+_simcse_model = None
+_simcse_tokenizer = None
 
 
 def _get_qwen(device: str = "cpu"):
@@ -43,6 +47,57 @@ def _get_qwen(device: str = "cpu"):
             .eval()
         )
     return _qwen_model, _qwen_tokenizer
+
+
+def _get_simcse(device: str = "cpu"):
+    """Lazy loader for SimCSE sentence encoder used in coherence scoring."""
+    global _simcse_model, _simcse_tokenizer
+    if _simcse_model is None:
+        _simcse_tokenizer = AutoTokenizer.from_pretrained(SIMCSE_MODEL_NAME)
+        _simcse_model = (
+            AutoModel.from_pretrained(
+                SIMCSE_MODEL_NAME,
+                use_safetensors=True,
+            )
+            .to(device)
+            .eval()
+        )
+    return _simcse_model, _simcse_tokenizer
+
+
+@torch.no_grad()
+def _encode_simcse(
+    texts: List[str],
+    *,
+    batch_size: int = 32,
+    max_length: int = 128,
+    device: str = "cpu",
+) -> torch.Tensor:
+    """
+    Encode texts into L2-normalized SimCSE embeddings.
+
+    SimCSE uses the pooled [CLS] representation for sentence embeddings.
+    """
+    model, tokenizer = _get_simcse(device)
+    chunks: list[torch.Tensor] = []
+
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start : start + batch_size]
+        enc = tokenizer(
+            batch,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+        ).to(device)
+        out = model(**enc)
+
+        # For BERT-based SimCSE checkpoints, pooler_output is the standard embedding.
+        emb = out.pooler_output
+        emb = F.normalize(emb, p=2, dim=1)
+        chunks.append(emb)
+
+    return torch.cat(chunks, dim=0)
 
 
 @torch.no_grad()
@@ -129,6 +184,40 @@ def compute_repetition_rate(
     return {
         "mean_distinct_n": float(np.mean(rates)),
         "per_text_distinct_n": rates,
+    }
+
+
+@torch.no_grad()
+def compute_coherence(
+    prompts: List[str],
+    responses: List[str],
+    device: str = "cpu",
+) -> dict:
+    """
+    Prompt-response coherence via SimCSE cosine similarity.
+
+    For each pair (prompt_i, response_i), compute cosine(simcse(prompt_i), simcse(response_i))
+    and report per-text values + dataset mean.
+    """
+    if len(prompts) != len(responses):
+        raise ValueError(
+            "prompts and responses must have the same length: "
+            f"got {len(prompts)} vs {len(responses)}"
+        )
+
+    if len(prompts) == 0:
+        return {
+            "mean_coherence": float("nan"),
+            "per_text_coherence": [],
+        }
+
+    prompt_emb = _encode_simcse(prompts, device=device)
+    response_emb = _encode_simcse(responses, device=device)
+
+    per = F.cosine_similarity(prompt_emb, response_emb, dim=1).cpu().tolist()
+    return {
+        "mean_coherence": float(np.mean(per)),
+        "per_text_coherence": per,
     }
 
 

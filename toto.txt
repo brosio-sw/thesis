@@ -2,4 +2,92 @@
 -my perplexity measure might favor conf llada
 - https://arxiv.org/pdf/2510.08632  : nice for carmen idea of between denoise steer but code not public
 
--gaussian et pca
+
+
+-question: 
+    -funny to look at the steer on non just masked; pretty effective, especially in the low alpha range
+    -surprised that perplexity doesn t rise with alpha. Dataset issue ? (eg in the bad patterns Review...). ALso preplexity itself might not be the best measure
+    -see that it is not pushing so high in sentiment ; could try pushing alpha or opportunity to work on the remasking thing
+
+
+
+PPlease edit `compare_mean_steering_adaptive_schedule_instruct.py` to add a new schedule mode called `mix_adaptive`, without removing any schedule modes already present.
+
+## What I want
+
+Keep all existing schedule modes as they are:
+
+* `fixed_1`
+* `fixed_2`
+* `fixed_3`
+* `adaptive_123`
+
+Just add:
+
+* `mix_adaptive`
+
+And for now, set the defaults so I only run this new one, like:
+
+```python
+# SCHEDULE_MODES = ["fixed_1", "fixed_2", "fixed_3", "adaptive_123", "mix_adaptive"]
+SCHEDULE_MODES = ["mix_adaptive"]
+```
+
+Do the same spirit for smoke-test defaults if useful.
+
+## Behavior of `mix_adaptive`
+
+This new mode should use:
+
+* `s_t` = steering score from the generated-only provisional continuation
+* `q_t` = confidence score from the current LLaDA step, without any extra model
+
+Please define `q_t` as:
+
+* the mean confidence of the top candidate tokens that are about to be committed in the current block
+* simplest version: mean of the top-3 candidate `baseline_scores` among currently masked positions in the current block
+* if fewer than 3 masked positions remain, use whatever is available
+
+Then implement this schedule rule:
+
+* if `s_t >= 2/3` and `q_t >= q_high` -> commit 3
+* elif `s_t >= 1/3` and `q_t >= q_mid` -> commit 2
+* else -> commit 1
+
+Then clip with remaining masks as usual:
+
+* `u_t = min(u_t, M_t)`
+
+Use initial thresholds:
+
+* `q_mid = 0.55`
+* `q_high = 0.75`
+
+## Important
+
+* do not add any extra model
+* keep the standard low-confidence ranking for WHICH tokens to commit
+* only change HOW MANY tokens are committed
+* keep EOS/EOT policy exactly as it is now
+* keep the current provisional `x0` logic exactly as it is now
+* for `mix_adaptive`, use `provisional_generated_only` as the score source for `s_t`
+
+## Outputs / metadata
+
+Please make sure:
+
+* run tags include `mix_adaptive`
+* `run_info.json` records the thresholds and that `q_t` is mean top-k candidate confidence
+* debug logs include:
+
+  * `s_t`
+  * `q_t`
+  * chosen `u_t`
+
+Please keep the code changes minimal and clean.
+Run a smoke test first and tell me if it worked.
+.
+
+
+
+add unsteered version

@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 """
-Closed-loop GradNorm commit experiment for LLaDA-Instruct.
+Closed-loop causal mixed-commit experiment for LLaDA-Instruct.
 
 This script keeps the same generation/eval setup as
-gradient_filling/grad_causal_validation_instruct.py, but changes token
+gradient_filling/diffmean_h3_sentiment_grad_test.py, but changes token
 commitment in fixed_1 schedule:
 - commit exactly 1 token per denoising step
-- select by mixed score using baseline low-confidence + normalized GradNorm
+- select by mixed score using baseline low-confidence + normalized online causal score
 
 mixed_score_i = lambda_mix * baseline_low_conf_score_i
-                + (1 - lambda_mix) * grad_norm_norm_i
+                + (1 - lambda_mix) * causal_norm_i
 
-Where grad_norm_norm_i is per-step min-max normalization across eligible
-candidate positions.
+Where causal_norm_i is per-step min-max normalization of
+causal_delta_i = S(full_provisional) - S(counterfactual_without_i)
+across eligible candidate positions.
 """
 
 import argparse
@@ -54,14 +55,14 @@ PROMPT_WORDS = 25
 STEER_LAYERS = list(range(9, 25))
 MASK_ID = 126336
 
-ALPHA = 1.0  # Steering alpha only.
+ALPHA = 0.50  # Steering alpha only.
 SCHEDULE_MODE = "fixed_1"
 SCHEDULE_SCORE_SOURCE = "provisional_full"
 LAMBDA_MIX_VALUES = [0.5, 0.75, 0.9, 1.0]
 
 SMOKE_TEST = False
 SMOKE_MAX_PROMPTS = 2
-MAX_PROMPTS = 125
+MAX_PROMPTS = 150
 
 NEUTRAL_EVAL_SET_PATH = Path(
     "data/speed_adapt/neutral_prefix_eval_set/full_run/neutral_prefix_eval_set.json"
@@ -76,7 +77,7 @@ GEN_PARAMS = dict(
 )
 
 DEFAULT_OUT_DIR = Path(
-    "data/gradient_filling/compare_mean_steering_online_gradnorm_mixed_commit_instruct"
+    "data/gradient_filling/compare_mean_steering_online_causal_mixed_commit_instruct"
 )
 
 BAD_PATTERNS = [
@@ -256,6 +257,7 @@ def ensure_encoder_layer_compat(model) -> None:
         return
 
     if hasattr(model, "model") and hasattr(model.model, "layers"):
+
         class _EncoderCompat:
             pass
 
@@ -270,6 +272,7 @@ def ensure_encoder_layer_compat(model) -> None:
         and hasattr(model.model.transformer, "__contains__")
         and "blocks" in model.model.transformer
     ):
+
         class _EncoderCompat:
             pass
 
@@ -353,58 +356,38 @@ def build_mask_only_steerer(
 
 
 class OnlineSentimentValidator:
-    """Compute full-text classifier gradients and token-level grad features."""
+    """Compute online full-text negative logits and batched rescoring."""
 
     def __init__(self, model_name: str = SENTIMENT_MODEL_NAME, device: str = SENTIMENT_DEVICE):
         self.device = torch.device(device)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         self.model = AutoModelForSequenceClassification.from_pretrained(model_name).to(self.device).eval()
 
-    @staticmethod
-    def _shared_chars(a: tuple[int, int], b: tuple[int, int]) -> int:
-        return max(0, min(a[1], b[1]) - max(a[0], b[0]))
-
-    def full_text_grad_attribution(self, text: str) -> dict[str, Any]:
-        safe_text = text if text.strip() else "."
-
         label2id = {
             str(k).upper(): int(v)
             for k, v in getattr(self.model.config, "label2id", {}).items()
         }
-        neg_label_id = int(label2id.get("NEGATIVE", 0))
+        self.neg_label_id = int(label2id.get("NEGATIVE", 0))
 
-        with torch.enable_grad():
+    def negative_logits_batch(self, texts: list[str], batch_size: int = 64) -> list[float]:
+        neg_logits: list[float] = []
+        for start in range(0, len(texts), batch_size):
+            batch = [t if t.strip() else "." for t in texts[start : start + batch_size]]
             enc = self.tokenizer(
-                safe_text,
+                batch,
                 return_tensors="pt",
+                padding=True,
                 truncation=True,
                 max_length=512,
-                return_offsets_mapping=True,
-            )
-            offsets = enc.pop("offset_mapping")[0].tolist()
-            input_ids = enc["input_ids"].to(self.device)
-            attention_mask = enc["attention_mask"].to(self.device)
+            ).to(self.device)
+            with torch.no_grad():
+                logits = self.model(**enc).logits
+            neg_logits.extend(logits[:, self.neg_label_id].detach().cpu().tolist())
+        return neg_logits
 
-            emb_layer = self.model.get_input_embeddings()
-            embeds = emb_layer(input_ids).detach()
-            embeds.requires_grad_(True)
-
-            self.model.zero_grad(set_to_none=True)
-            logits = self.model(inputs_embeds=embeds, attention_mask=attention_mask).logits
-            neg_logit = logits[0, neg_label_id]
-            neg_logit.backward()
-
-            grads = embeds.grad[0].detach()
-            grad_norm = grads.norm(dim=-1)
-
-            token_ids = input_ids[0].detach().cpu().tolist()
-            token_texts = self.tokenizer.convert_ids_to_tokens(token_ids)
-
-        return {
-            "classifier_offsets": [(int(a), int(b)) for a, b in offsets],
-            "classifier_tokens": token_texts,
-            "grad_norm": grad_norm.detach().cpu().tolist(),
-        }
+    def negative_logit(self, text: str) -> float:
+        safe_text = text if text.strip() else "."
+        return float(self.negative_logits_batch([safe_text], batch_size=1)[0])
 
 
 class LLaDASpanMapper:
@@ -432,7 +415,21 @@ class LLaDASpanMapper:
         return spans
 
 
-def generate_with_mixed_gradnorm_commit(
+def _cleanup_removed_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if text else "."
+
+
+def _remove_char_span(text: str, span: tuple[int, int]) -> str:
+    s, e = span
+    s = max(0, min(len(text), s))
+    e = max(0, min(len(text), e))
+    if e <= s:
+        return _cleanup_removed_text(text)
+    return _cleanup_removed_text(text[:s] + text[e:])
+
+
+def generate_with_mixed_causal_commit(
     *,
     model,
     tokenizer,
@@ -492,7 +489,6 @@ def generate_with_mixed_gradnorm_commit(
             while bool((x[:, block_start:block_end] == mask_id).any().item()):
                 total_denoising_steps += 1
 
-                # Keep LLaDA decoding efficient. Classifier attribution runs outside this block.
                 with torch.no_grad():
                     mask_index = x == mask_id
                     logits = model(x, attention_mask=attention_mask_full).logits.to(x.device)
@@ -537,73 +533,51 @@ def generate_with_mixed_gradnorm_commit(
                     provisional_full_text = span_mapper.decode_llada(provisional_ids)
                     llada_spans = span_mapper.position_spans(provisional_ids, candidate_pos)
 
-                    grad_pack = validator.full_text_grad_attribution(provisional_full_text)
-                    cls_offsets = [tuple(xy) for xy in grad_pack["classifier_offsets"]]
-                    cls_tokens = list(grad_pack["classifier_tokens"])
-                    cls_grad_norm = list(grad_pack["grad_norm"])
+                    full_neg_logit = validator.negative_logit(provisional_full_text)
 
-                    baseline_vals: list[float] = []
-                    gradnorm_weighted_vals: list[float] = []
                     candidate_records: list[dict[str, Any]] = []
+                    baseline_vals: list[float] = []
 
                     for pos in candidate_pos:
                         span = llada_spans.get(pos, (0, 0))
-
-                        overlap_idx: list[int] = []
-                        overlap_weights: list[float] = []
-                        overlap_tokens: list[str] = []
-                        overlap_offsets: list[tuple[int, int]] = []
-
-                        w_sum = 0.0
-                        gnorm_weighted_num = 0.0
-
-                        for j, cls_span in enumerate(cls_offsets):
-                            cls_len = int(cls_span[1] - cls_span[0])
-                            if cls_len <= 0:
-                                continue
-                            shared = OnlineSentimentValidator._shared_chars(span, cls_span)
-                            if shared <= 0:
-                                continue
-                            w = float(shared / cls_len)
-
-                            overlap_idx.append(j)
-                            overlap_weights.append(w)
-                            overlap_tokens.append(cls_tokens[j])
-                            overlap_offsets.append((int(cls_span[0]), int(cls_span[1])))
-
-                            w_sum += w
-                            gnorm_weighted_num += w * float(cls_grad_norm[j])
-
-                        gnorm_weighted_mean = float(gnorm_weighted_num / w_sum) if w_sum > 0.0 else 0.0
                         baseline_score = float(baseline_scores[b, pos].detach().cpu().item())
-
-                        baseline_vals.append(baseline_score)
-                        gradnorm_weighted_vals.append(gnorm_weighted_mean)
+                        token_id = int(provisional_ids[pos])
+                        token_text = tokenizer.decode(
+                            [token_id],
+                            skip_special_tokens=False,
+                            clean_up_tokenization_spaces=False,
+                        )
 
                         candidate_records.append(
                             {
                                 "position": int(pos),
                                 "position_in_generated_region": int(pos - prompt_len),
-                                "candidate_token_id": int(provisional_ids[pos]),
-                                "candidate_token_text": tokenizer.decode(
-                                    [int(provisional_ids[pos])],
-                                    skip_special_tokens=False,
-                                    clean_up_tokenization_spaces=False,
-                                ),
+                                "candidate_token_id": token_id,
+                                "candidate_token_text": token_text,
                                 "llada_char_span": [int(span[0]), int(span[1])],
                                 "baseline_low_conf_score": baseline_score,
-                                "grad_norm_weighted_mean": gnorm_weighted_mean,
-                                "overlap_classifier_token_indices": overlap_idx,
-                                "overlap_classifier_token_texts": overlap_tokens,
-                                "overlap_classifier_offsets": [[a, b] for a, b in overlap_offsets],
-                                "overlap_weights": overlap_weights,
                             }
                         )
+                        baseline_vals.append(baseline_score)
 
-                    gradnorm_norm_vals = _normalize_minmax(gradnorm_weighted_vals)
+                    cf_texts = [
+                        _remove_char_span(provisional_full_text, tuple(rec["llada_char_span"]))
+                        for rec in candidate_records
+                    ]
+                    cf_logits = validator.negative_logits_batch(cf_texts)
+
+                    causal_deltas: list[float] = []
+                    for rec, cf_logit, cf_text in zip(candidate_records, cf_logits, cf_texts):
+                        delta = float(full_neg_logit - float(cf_logit))
+                        rec["counterfactual_negative_logit"] = float(cf_logit)
+                        rec["counterfactual_text_preview"] = cf_text[:280]
+                        rec["causal_delta"] = delta
+                        causal_deltas.append(delta)
+
+                    causal_norm_vals = _normalize_minmax(causal_deltas)
                     mixed_vals = [
-                        (float(lambda_mix) * bscore) + ((1.0 - float(lambda_mix)) * gnorm_norm)
-                        for bscore, gnorm_norm in zip(baseline_vals, gradnorm_norm_vals)
+                        (float(lambda_mix) * bscore) + ((1.0 - float(lambda_mix)) * causal_norm)
+                        for bscore, causal_norm in zip(baseline_vals, causal_norm_vals)
                     ]
 
                     best_local_idx = int(np.argmax(np.asarray(mixed_vals, dtype=np.float64)))
@@ -611,8 +585,8 @@ def generate_with_mixed_gradnorm_commit(
                     transfer_index[b, chosen_pos] = True
 
                     if enable_debug:
-                        for rec, gnorm_norm, mixed in zip(candidate_records, gradnorm_norm_vals, mixed_vals):
-                            rec["grad_norm_norm"] = float(gnorm_norm)
+                        for rec, causal_norm, mixed in zip(candidate_records, causal_norm_vals, mixed_vals):
+                            rec["causal_norm"] = float(causal_norm)
                             rec["lambda_mix"] = float(lambda_mix)
                             rec["mixed_score"] = float(mixed)
 
@@ -621,11 +595,13 @@ def generate_with_mixed_gradnorm_commit(
                             "block_idx": int(block_idx),
                             "batch_idx": int(b),
                             "schedule_mode": SCHEDULE_MODE,
-                            "commit_policy": "fixed_1_mixed_baseline_gradnorm",
+                            "commit_policy": "fixed_1_mixed_baseline_causal",
                             "lambda_mix": float(lambda_mix),
-                            "gradnorm_normalization": {
+                            "full_provisional_negative_logit": float(full_neg_logit),
+                            "full_provisional_text_preview": provisional_full_text[:500],
+                            "causal_normalization": {
                                 "type": "per_step_minmax_over_eligible_candidates",
-                                "constant_case": "if max==min then grad_norm_norm=0 for all candidates",
+                                "constant_case": "if max==min then causal_norm=0 for all candidates",
                             },
                             "chosen_commit_position": chosen_pos,
                             "num_candidates": int(len(candidate_records)),
@@ -734,7 +710,7 @@ def run_single_condition(
     enable_debug: bool,
     validator: OnlineSentimentValidator,
 ) -> dict[str, Any]:
-    run_tag = f"a{alpha:.1f}__mixlam_{_mix_lambda_tag(lambda_mix)}"
+    run_tag = f"a{alpha:.1f}__causalmix_{_mix_lambda_tag(lambda_mix)}"
     run_dir = out_dir / run_tag
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -745,8 +721,8 @@ def run_single_condition(
     denoising_steps: list[int] = []
     debug_all: list[list[dict[str, Any]]] = []
 
-    for prompt in tqdm(prompts, desc=f"run[a={alpha:.1f}, mixlam={lambda_mix:.2f}]", leave=False):
-        answer, n_steps, dbg = generate_with_mixed_gradnorm_commit(
+    for prompt in tqdm(prompts, desc=f"run[a={alpha:.1f}, causalmix={lambda_mix:.2f}]", leave=False):
+        answer, n_steps, dbg = generate_with_mixed_causal_commit(
             model=model,
             tokenizer=tokenizer,
             prompt=prompt,
@@ -762,7 +738,7 @@ def run_single_condition(
         debug_all.append(dbg)
 
     metrics = evaluate_texts_filtered(prompts, answers, denoising_steps)
-    metrics["method"] = "mean_mask_only_gradnorm_mixed_commit"
+    metrics["method"] = "mean_mask_only_causal_mixed_commit"
     metrics["alpha"] = float(alpha)
     metrics["schedule_mode"] = SCHEDULE_MODE
     metrics["schedule_score_source"] = SCHEDULE_SCORE_SOURCE
@@ -811,22 +787,24 @@ def run_single_condition(
             "mix_lambda": None,
             "calibration_path": None,
             "output_subdir": str(run_dir.relative_to(out_dir)),
-            "commit_policy": "fixed_1_mixed_baseline_gradnorm",
+            "commit_policy": "fixed_1_mixed_baseline_causal",
             "schedule": {
                 "fixed_1": "always commit 1",
-                "ranking": "select by mixed_score = lambda_mix*baseline + (1-lambda_mix)*grad_norm_norm",
+                "ranking": "select by mixed_score = lambda_mix*baseline + (1-lambda_mix)*causal_norm",
                 "note": "lambda_mix=1.0 is pure baseline ablation",
                 "block_loop": "while masked tokens remain in block",
             },
-            "gradnorm_commit_scoring": {
+            "causal_commit_scoring": {
                 "baseline_component": "baseline_low_conf_score",
-                "gradient_component": "grad_norm_weighted_mean",
-                "gradient_mapping": "full provisional text classifier grad_norm mapped to candidate span via overlap weights",
+                "causal_component": "causal_delta = S(full_provisional) - S(counterfactual_without_span)",
+                "sentiment_scalar": "negative_logit",
+                "counterfactual_construction": "remove exact candidate LLaDA char span, then whitespace cleanup",
+                "online_scope": "computed on each denoising step using the same provisional text seen by sampler",
                 "normalization": {
                     "type": "per_step_minmax_over_eligible_candidates",
-                    "constant_case": "if max==min then grad_norm_norm=0 for all candidates",
+                    "constant_case": "if max==min then causal_norm=0 for all candidates",
                 },
-                "mixed_score": "lambda_mix * baseline_low_conf_score + (1-lambda_mix) * grad_norm_norm",
+                "mixed_score": "lambda_mix * baseline_low_conf_score + (1-lambda_mix) * causal_norm",
                 "lambda_mix_values": LAMBDA_MIX_VALUES,
             },
             "termination_policy": {
@@ -980,7 +958,7 @@ def main() -> None:
             validator=validator,
         )
 
-        run_key = f"a{ALPHA:.1f}__mixlam_{_mix_lambda_tag(lambda_mix)}"
+        run_key = f"a{ALPHA:.1f}__causalmix_{_mix_lambda_tag(lambda_mix)}"
         summary["results"][run_key] = metrics
 
         aggregate_rows.append(
